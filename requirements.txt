@@ -1,0 +1,23 @@
+# HTTP & Async
+httpx
+aiohttp
+asyncio
+
+# Image Processing
+Pillow
+numpy
+
+# Luma AI
+lumaai
+
+# Env & Config
+python-dotenv
+pydantic
+pydantic-settings
+
+# CLI (optional orchestrator interface)
+typer
+
+# Dev
+pytest
+pytest-asyncio
