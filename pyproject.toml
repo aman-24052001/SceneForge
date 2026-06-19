@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sceneforge"
+version = "0.2.0"
+description = "Local images to navigable 3D Gaussian Splat scene. Free, self-hosted, CPU-capable (COLMAP + OpenSplat)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Aman Kumar" }
+]
+dependencies = [
+    "Pillow",
+    "numpy",
+    "typer",
+    "mcp",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "PyYAML",
+]
+
+[project.scripts]
+sceneforge = "sceneforge.orchestrator:app"
+sceneforge-mcp = "sceneforge.mcp_server:main"
+
+[project.urls]
+Repository = "https://github.com/aman-24052001/SceneForge"
+
+[tool.setuptools.packages.find]
+include = ["sceneforge*"]
+
+# NOTE: this only packages the Python orchestration layer. COLMAP and
+# OpenSplat are external binaries this package shells out to -- they are
+# NOT pip-installable and must be present on PATH separately. See
+# README.md "External binaries" section.

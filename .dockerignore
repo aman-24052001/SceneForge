@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.pytest_cache
+docs/
+README.md
+LICENSE
+assets/test_images
+sceneforge_output
+*.egg-info

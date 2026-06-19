@@ -61,6 +61,44 @@ def test_validator_warns_on_too_few_images():
     assert any("recommend" in w for w in report.warnings)
 
 
+def test_validate_match_quality_on_real_database(tmp_path):
+    """
+    Run real COLMAP matching against our sample images, then confirm
+    validate_match_quality correctly reports a HEALTHY result -- our
+    icosphere test scene was specifically fixed (see docs/test_log.md)
+    to produce 200+ inlier pairs, well above the gate threshold.
+    """
+    matching_result = colmap_runner.run_feature_matching(
+        image_dir=TEST_IMAGES_DIR,
+        project_dir=tmp_path / "colmap",
+    )
+    quality = validator.validate_match_quality(matching_result.database_path)
+    assert quality.passed is True
+    assert quality.best_pair_inliers >= validator.MIN_INLIERS_GOOD_PAIR
+    assert quality.total_pairs > 0
+
+
+def test_validate_match_quality_fails_on_missing_database(tmp_path):
+    quality = validator.validate_match_quality(tmp_path / "nonexistent.db")
+    assert quality.passed is False
+    assert quality.total_pairs == 0
+    assert any("not found" in w for w in quality.warnings)
+
+
+def test_validate_match_quality_fails_on_empty_database(tmp_path):
+    """An empty/no-pairs database should fail the gate, not pass silently."""
+    import sqlite3
+    db_path = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE two_view_geometries (pair_id INTEGER, rows INTEGER)")
+    conn.commit()
+    conn.close()
+
+    quality = validator.validate_match_quality(db_path)
+    assert quality.passed is False
+    assert quality.total_pairs == 0
+
+
 # --- colmap_runner -----------------------------------------------------------
 
 def test_colmap_binary_is_discoverable():
@@ -76,6 +114,37 @@ def test_colmap_runner_raises_clean_error_when_binary_missing(monkeypatch):
         colmap_runner._require_colmap()
 
 
+def test_colmap_runner_matching_is_checkpointed(tmp_path):
+    """
+    Running feature_matching twice against the same project_dir should
+    skip the second run (checkpoint behavior) rather than redoing
+    expensive feature extraction + matching from scratch.
+    """
+    project_dir = tmp_path / "colmap"
+    result1 = colmap_runner.run_feature_matching(TEST_IMAGES_DIR, project_dir)
+    mtime1 = result1.database_path.stat().st_mtime
+
+    result2 = colmap_runner.run_feature_matching(TEST_IMAGES_DIR, project_dir)
+    mtime2 = result2.database_path.stat().st_mtime
+
+    assert result1.database_path == result2.database_path
+    assert mtime1 == mtime2  # untouched -- second call was skipped
+
+
+def test_colmap_runner_force_reruns_matching(tmp_path):
+    project_dir = tmp_path / "colmap"
+    result1 = colmap_runner.run_feature_matching(TEST_IMAGES_DIR, project_dir)
+    mtime1 = result1.database_path.stat().st_mtime
+
+    import time
+    time.sleep(0.05)
+
+    result2 = colmap_runner.run_feature_matching(TEST_IMAGES_DIR, project_dir, force=True)
+    mtime2 = result2.database_path.stat().st_mtime
+
+    assert mtime2 > mtime1  # database.db was actually rewritten
+
+
 # --- engine -----------------------------------------------------------
 
 def test_engine_raises_clean_error_when_opensplat_missing():
@@ -84,6 +153,48 @@ def test_engine_raises_clean_error_when_opensplat_missing():
     # OpenSplatNotFoundError, not a generic crash.
     with pytest.raises(engine.OpenSplatNotFoundError):
         engine._resolve_binary(None)
+
+
+def test_engine_estimate_runtime_warns_without_gpu(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)  # no nvidia-smi
+    estimate = engine.estimate_runtime(iterations=1000, num_images=20)
+    assert estimate.gpu_available is False
+    assert estimate.warning is not None
+    assert "CPU" in estimate.warning
+    assert str(engine.CPU_SLOWDOWN_FACTOR) in estimate.warning
+
+
+def test_engine_estimate_runtime_silent_with_gpu(monkeypatch, tmp_path):
+    fake_nvidia_smi = tmp_path / "nvidia-smi"
+    fake_nvidia_smi.touch()
+    monkeypatch.setattr(shutil, "which", lambda name: str(fake_nvidia_smi) if name == "nvidia-smi" else None)
+    estimate = engine.estimate_runtime(iterations=1000, num_images=20)
+    assert estimate.gpu_available is True
+    assert estimate.warning is None
+
+
+def test_engine_train_splat_is_checkpointed(tmp_path, monkeypatch):
+    """
+    If splat.ply already exists, train_splat should skip invoking the
+    (slow) opensplat binary entirely -- verified here by making a fake
+    binary that would raise if actually called.
+    """
+    output_dir = tmp_path / "splat"
+    output_dir.mkdir(parents=True)
+    fake_ply = output_dir / "splat.ply"
+    fake_ply.write_bytes(b"fake ply content")
+
+    def explode(*args, **kwargs):
+        raise AssertionError("subprocess.run should NOT have been called -- checkpoint failed")
+
+    monkeypatch.setattr("subprocess.run", explode)
+
+    result = engine.train_splat(
+        colmap_project_dir=tmp_path / "colmap",
+        output_dir=output_dir,
+        binary_path="/fake/opensplat",  # would fail _resolve_binary check if reached for real exec
+    )
+    assert result.ply_path == fake_ply
 
 
 # --- viewer -----------------------------------------------------------
@@ -125,6 +236,34 @@ def test_orchestrator_chains_stages_in_order(tmp_path):
     assert (sparse_dir / "points3D.bin").exists()
 
 
+def test_orchestrator_resumes_after_simulated_crash(tmp_path):
+    """
+    Simulates the exact scenario from the gap analysis: a long CPU run
+    crashes after COLMAP finishes but before/during OpenSplat. Re-invoking
+    run_pipeline should NOT redo the (expensive) COLMAP stages -- their
+    database.db / sparse model timestamps should be untouched.
+    """
+    # First invocation: fails at engine (opensplat not installed), but
+    # COLMAP's matching + mapping should have completed and been written.
+    with pytest.raises(engine.OpenSplatNotFoundError):
+        orchestrator.run_pipeline(images_dir=TEST_IMAGES_DIR, output_dir=tmp_path, iterations=5)
+
+    db_path = tmp_path / "colmap" / "database.db"
+    sparse_images_bin = tmp_path / "colmap" / "sparse" / "0" / "images.bin"
+    assert db_path.exists()
+    assert sparse_images_bin.exists()
+    db_mtime_before = db_path.stat().st_mtime
+    sparse_mtime_before = sparse_images_bin.stat().st_mtime
+
+    # Second invocation ("resume"): should hit the same engine error again,
+    # but WITHOUT re-running feature matching or mapping.
+    with pytest.raises(engine.OpenSplatNotFoundError):
+        orchestrator.run_pipeline(images_dir=TEST_IMAGES_DIR, output_dir=tmp_path, iterations=5)
+
+    assert db_path.stat().st_mtime == db_mtime_before
+    assert sparse_images_bin.stat().st_mtime == sparse_mtime_before
+
+
 def test_orchestrator_cli_help_works():
     from typer.testing import CliRunner
     runner = CliRunner()
@@ -132,3 +271,116 @@ def test_orchestrator_cli_help_works():
     assert result.exit_code == 0
     assert "--images" in result.output
     assert "--iterations" in result.output
+
+
+def test_orchestrator_quality_gate_stops_before_mapper(tmp_path, monkeypatch):
+    """
+    Simulates a degenerate match-quality result (as we genuinely hit with
+    the flat-cube texture during development) and confirms the pipeline
+    raises PipelineAborted BEFORE calling colmap_runner.run_mapping --
+    i.e. it doesn't burn CPU time on a doomed reconstruction.
+    """
+    def fake_bad_quality(database_path):
+        return validator.MatchQualityReport(
+            passed=False, total_pairs=10, pairs_with_inliers=2,
+            best_pair_inliers=5, warnings=["simulated degenerate scene"],
+        )
+
+    def explode_if_called(*args, **kwargs):
+        raise AssertionError("run_mapping should NOT have been called -- quality gate failed")
+
+    monkeypatch.setattr(validator, "validate_match_quality", fake_bad_quality)
+    monkeypatch.setattr(colmap_runner, "run_mapping", explode_if_called)
+
+    with pytest.raises(orchestrator.PipelineAborted):
+        orchestrator.run_pipeline(
+            images_dir=TEST_IMAGES_DIR,
+            output_dir=tmp_path,
+            iterations=5,
+        )
+
+
+# --- mcp_server -----------------------------------------------------------
+
+def test_mcp_server_registers_expected_tools():
+    import asyncio
+    from sceneforge.mcp_server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    tool_names = {t.name for t in tools}
+    assert tool_names == {
+        "start_pipeline", "check_job_status", "get_viewer_path",
+        "list_jobs", "check_environment",
+    }
+
+
+def test_mcp_check_environment_reflects_real_state():
+    from sceneforge.mcp_server import check_environment
+
+    result = check_environment()
+    # This sandbox has colmap installed via apt, but NOT opensplat
+    # (couldn't be built -- see docs/test_log.md). Confirm the tool
+    # reports the genuine state, not a hardcoded/optimistic one.
+    assert result["colmap_available"] is True
+    assert result["opensplat_available"] is False
+    assert result["ready_to_run"] is False
+
+
+def test_mcp_get_viewer_path_errors_on_unknown_job():
+    from sceneforge.mcp_server import get_viewer_path
+
+    result = get_viewer_path("this-job-does-not-exist")
+    assert "error" in result
+
+
+def test_mcp_get_viewer_path_errors_on_incomplete_job():
+    from sceneforge.mcp_server import get_viewer_path, _jobs, Job, JobStatus
+
+    fake_job = Job(job_id="incomplete-test-job", images_dir="x", output_dir="y", status=JobStatus.RUNNING)
+    _jobs["incomplete-test-job"] = fake_job
+
+    result = get_viewer_path("incomplete-test-job")
+    assert "error" in result
+    assert "not completed" in result["error"]
+
+
+def test_mcp_start_pipeline_runs_async_and_reports_failure(tmp_path):
+    """
+    Full async job lifecycle against REAL COLMAP execution: start_pipeline
+    must return immediately (non-blocking), then check_job_status must
+    show the job transition from running -> failed (since opensplat isn't
+    installed), with the real COLMAP stages having actually executed in
+    the background thread first.
+    """
+    import time
+    from sceneforge.mcp_server import start_pipeline, check_job_status
+
+    start_time = time.time()
+    result = start_pipeline(
+        images_dir=str(TEST_IMAGES_DIR),
+        output_dir=str(tmp_path),
+        iterations=5,
+    )
+    call_duration = time.time() - start_time
+
+    # The call itself must return almost instantly -- it must NOT block
+    # for the ~70+ seconds a real COLMAP run takes.
+    assert call_duration < 2.0, "start_pipeline blocked instead of running in background"
+    job_id = result["job_id"]
+    assert result["status"] == "running"
+
+    # Poll until the background thread finishes (real COLMAP execution).
+    final_status = None
+    for _ in range(60):
+        status = check_job_status(job_id)
+        if status["status"] in ("completed", "failed", "aborted"):
+            final_status = status
+            break
+        time.sleep(2)
+
+    assert final_status is not None, "job never finished within timeout"
+    assert final_status["status"] == "failed"
+    assert "OpenSplatNotFoundError" in final_status["error"]
+
+    # Confirm COLMAP genuinely ran in the background (not skipped).
+    assert (tmp_path / "colmap" / "sparse" / "0" / "images.bin").exists()

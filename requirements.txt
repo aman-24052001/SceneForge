@@ -5,6 +5,9 @@ numpy
 # CLI
 typer
 
+# MCP server (agentic/programmatic interface)
+mcp
+
 # Testing
 pytest
 

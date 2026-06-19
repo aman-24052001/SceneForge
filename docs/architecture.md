@@ -47,11 +47,43 @@ cost, no API keys**. Research findings that drove the final design:
   `.ply` directly, so no client-side conversion needed.
 
 ### Stage 6: Orchestrator (`sceneforge/orchestrator`)
-- Chains stages 1-5 in order.
+- Chains stages 1-5 in order, with a quality gate between matching and
+  mapping (see below).
 - Typer-based CLI: `python3 cli.py run --images <dir> --out <dir>`.
 - Stage-specific exceptions propagate with clear messages rather than
   being swallowed — see `docs/test_log.md` for confirmation this chaining
   works correctly against a real COLMAP run.
+
+### Stage 7: MCP Server (`sceneforge/mcp_server`)
+- Exposes the pipeline as 5 MCP tools for agentic/programmatic use,
+  on top of (not instead of) the CLI.
+- Async, job-based: `start_pipeline` returns immediately; `check_job_status`
+  polls. This avoids blocking an agent's turn for the pipeline's full
+  duration (minutes to hours on CPU).
+- See `docs/mcp_server.md` for the tool reference and design rationale.
+
+## Checkpoint / Resume Design
+
+Every expensive subprocess-calling function (`colmap_runner.run_feature_matching`,
+`colmap_runner.run_mapping`, `engine.train_splat`) checks whether its
+output already exists on disk before running, and skips the subprocess
+call if so (unless `force=True`). This means re-invoking the orchestrator
+(or an MCP `start_pipeline` call with the same `output_dir`) after a crash
+resumes from the last completed stage instead of redoing everything --
+important on CPU runs where a single stage can take tens of minutes.
+
+## Quality Gate Design
+
+`validator.validate_match_quality()` runs after COLMAP's matcher but
+before the mapper, inspecting `database.db`'s `two_view_geometries` table
+directly for verified geometric inlier counts. If no image pair clears a
+minimum inlier threshold, the orchestrator raises `PipelineAborted` and
+stops -- this is specifically designed to catch the failure mode
+discovered during development: a flat-faced, texture-repetitive object
+produces raw SIFT matches that *look* fine in count but get rejected by
+RANSAC as geometrically inconsistent, and COLMAP's mapper then silently
+gives up rather than erroring loudly. See `docs/test_log.md` for the full
+account of how this was found and fixed.
 
 ## Math → Code Mapping
 

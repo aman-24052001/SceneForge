@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast checks: syntax, imports, fetcher/validator/viewer/engine unit
+  # tests that don't need COLMAP installed. Runs on every push/PR.
+  fast-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check all modules
+        run: |
+          python -m py_compile sceneforge/*/__init__.py sceneforge/__init__.py cli.py
+
+      - name: Run fast unit tests (no real COLMAP calls)
+        run: |
+          python -m pytest tests/test_modules.py -v \
+            -k "fetcher or validator_passes or validator_warns or colmap_binary or colmap_runner_raises or engine or viewer or cli_help or mcp_server_registers or mcp_check_environment or mcp_get_viewer_path"
+
+  # Slower integration checks: installs real COLMAP (free, apt-installable,
+  # no GPU needed) and runs the tests that exercise actual SfM reconstruction
+  # against the synthetic test images. This is what actually proves the
+  # colmap_runner wiring + validator.validate_match_quality work correctly,
+  # not just that they're syntactically valid.
+  colmap-integration-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install COLMAP (CPU, free, no GPU runner needed)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends colmap
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run COLMAP-dependent tests
+        run: |
+          python -m pytest tests/test_modules.py -v \
+            -k "validate_match_quality or checkpointed or chains_stages_in_order or quality_gate_stops or resumes_after_simulated_crash or mcp_start_pipeline"
+        timeout-minutes: 25
+
+  # Regenerate the synthetic test scene to confirm the generator script
+  # itself still runs cleanly (catches accidental breakage independent
+  # of the COLMAP/OpenSplat pipeline).
+  test-scene-generator:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install Pillow numpy
+
+      - name: Generate synthetic test scene
+        run: python scripts/generate_test_scene.py
+
+      - name: Confirm images were created
+        run: |
+          count=$(find assets/test_images -name "*.png" | wc -l)
+          echo "Generated $count images"
+          test "$count" -ge 20
