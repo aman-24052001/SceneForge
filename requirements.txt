@@ -1,23 +1,14 @@
-# HTTP & Async
-httpx
-aiohttp
-asyncio
-
-# Image Processing
+# Image handling
 Pillow
 numpy
 
-# Luma AI
-lumaai
-
-# Env & Config
-python-dotenv
-pydantic
-pydantic-settings
-
-# CLI (optional orchestrator interface)
+# CLI
 typer
 
-# Dev
+# Testing
 pytest
-pytest-asyncio
+
+# --- External binaries required (NOT pip-installable, see docs/architecture.md) ---
+# colmap      -- apt-get install colmap  (CPU build works fine)
+# opensplat   -- build from source: https://github.com/pierotofy/OpenSplat
+#                CPU build needs: OpenCV dev + libtorch (CPU build)
